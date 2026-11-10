@@ -4217,7 +4217,7 @@ mod tests {
             let _ = t.grid.borrow_mut().vt.frame();
         });
         focused.update(cx, |t, cx| {
-            assert!(t.ingest(vec![Stream::Data(b"\x1b]2;\u{280b} working\x07".to_vec())], cx));
+            assert!(t.ingest(vec![Stream::Data(b"\x1b]2;\xe2\xa0\x8b working\x07".to_vec())], cx));
         });
         assert_eq!(focused_notifies.get(), 1);
 
