@@ -135,9 +135,10 @@ pub struct TerminalView {
     grid: Rc<RefCell<Grid>>,
     focus: FocusHandle,
     was_focused: bool,
+    window_active: bool,
     /// The window frame this terminal was last put on screen in (`FRAME`).
     shown_in: Cell<u64>,
-    /// When the person last typed here: output right after is shown at once.
+    /// When the person last sent input here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: Point<f32>,
@@ -294,6 +295,7 @@ impl TerminalView {
             })),
             focus: cx.focus_handle(),
             was_focused: false,
+            window_active: false,
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
             scrolled: point(0.0, 0.0),
@@ -576,10 +578,13 @@ impl TerminalView {
         open
     }
 
-    /// Output is drawn on a shared clock (~30 a second), so panes printing
-    /// out of step share window frames; right after typing, at once.
+    /// Output is drawn on a shared clock (~30 a second), so background panes
+    /// printing out of step share window frames; the focused pane in an active
+    /// window, and any pane right after input, at once.
     fn redraw_soon(&self, cx: &mut Context<Self>) {
-        if self.typed_at.get().is_some_and(|t| t.elapsed() < Duration::from_millis(200)) {
+        if (self.was_focused && self.window_active)
+            || self.typed_at.get().is_some_and(|t| t.elapsed() < Duration::from_millis(200))
+        {
             cx.notify();
             return;
         }
@@ -627,15 +632,25 @@ impl TerminalView {
         self.shown_in.get() == FRAME.load(Ordering::Relaxed)
     }
 
-    fn send(&self, bytes: &[u8]) {
+    fn send_input(&self, g: &Grid, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         self.typed_at.set(Some(Instant::now()));
-        let mut g = self.grid.borrow_mut();
-        if let Some(ch) = g.channel
-            && !bytes.is_empty()
-        {
-            g.vt.scroll_to_bottom();
+        if let Some(ch) = g.channel {
             g.core.input(ch, bytes);
         }
+    }
+
+    fn send(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut g = self.grid.borrow_mut();
+        if g.channel.is_some() {
+            g.vt.scroll_to_bottom();
+        }
+        self.send_input(&g, bytes);
     }
 
     /// Files dropped on the terminal: their paths typed in, quoted, as a paste
@@ -881,9 +896,7 @@ impl TerminalView {
         if g.vt.mouse_tracking() {
             let ((x, y), size) = mouse_at(&g, ev.position);
             let out = scroll_mouse_bytes(&mut g.vt, steps, ev.modifiers, x, y, size);
-            if let Some(ch) = g.channel {
-                g.core.input(ch, &out);
-            }
+            self.send_input(&g, &out);
         } else if n == 0 {
             return;
         } else if g.vt.alt_screen() {
@@ -892,9 +905,7 @@ impl TerminalView {
             for _ in 0..n {
                 out.extend(g.vt.encode_key(key, 0, 0, None, None));
             }
-            if let Some(ch) = g.channel {
-                g.core.input(ch, &out);
-            }
+            self.send_input(&g, &out);
         } else {
             g.vt.scroll_viewport(if up { -(n as isize) } else { n as isize });
         }
@@ -2111,6 +2122,7 @@ impl Render for TerminalView {
                 g.core.focus(ch, focused);
             }
         }
+        self.window_active = window.is_window_active();
         let cell = cell_size(window);
         let hover = self.grid.borrow().hover;
         let found = hover.filter(|_| link_mods(&window.modifiers())).and_then(|pos| self.link_at(pos));
@@ -4146,5 +4158,143 @@ mod tests {
         assert_eq!(pages_to_lines(-0.5, 24), -12);
         assert_eq!(pages_to_lines(-0.5, 25), -13, "half of an odd row count rounds away from zero");
         assert_eq!(pages_to_lines(0.02, 24), 0);
+    }
+
+    #[gpui::test]
+    fn focused_output_notifies_immediately_while_background_waits_for_clock(cx: &mut gpui::TestAppContext) {
+        use crate::hc::Stream;
+        use gpui::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        struct Root {
+            focused: Entity<super::TerminalView>,
+            other: Entity<super::TerminalView>,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                super::next_frame();
+                self.focused.read(cx).mark_shown();
+                self.other.read(cx).mark_shown();
+                div()
+                    .w(px(400.))
+                    .h(px(200.))
+                    .flex()
+                    .child(div().w(px(200.)).h(px(200.)).child(self.focused.clone()))
+                    .child(div().w(px(200.)).h(px(200.)).child(self.other.clone()))
+            }
+        }
+
+        cx.update(gpui_base::init);
+        let (root, cx) = cx.add_window_view(|_, cx| Root {
+            focused: cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 6), cx)),
+            other: cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t2".into(), (40, 6), cx)),
+        });
+        let (focused, other) = root.read_with(cx, |root, _| (root.focused.clone(), root.other.clone()));
+        cx.update(|window, app| {
+            window.activate_window();
+            focused.update(app, |t, cx| t.focus.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        focused.read_with(cx, |t, _| assert!(t.was_focused && t.window_active));
+        other.read_with(cx, |t, _| assert!(!t.was_focused && t.window_active));
+
+        let focused_notifies = Rc::new(Cell::new(0usize));
+        let other_notifies = Rc::new(Cell::new(0usize));
+        cx.update(|_, app| {
+            let seen = focused_notifies.clone();
+            app.observe(&focused, move |_, _| seen.set(seen.get() + 1)).detach();
+            let seen = other_notifies.clone();
+            app.observe(&other, move |_, _| seen.set(seen.get() + 1)).detach();
+        });
+
+        focused.update(cx, |t, cx| {
+            assert!(t.ingest(vec![Stream::Data(b"hello\r\n".to_vec())], cx));
+        });
+        assert_eq!(focused_notifies.get(), 1);
+
+        other.update(cx, |t, cx| {
+            assert!(t.ingest(vec![Stream::Data(b"background\r\n".to_vec())], cx));
+        });
+        assert_eq!(other_notifies.get(), 0);
+        cx.run_until_parked();
+        assert_eq!(other_notifies.get(), 0);
+        cx.executor().advance_clock(Duration::from_millis(33));
+        cx.run_until_parked();
+        assert_eq!(other_notifies.get(), 1);
+
+        focused.update(cx, |t, _| {
+            let _ = t.grid.borrow_mut().vt.frame();
+        });
+        focused.update(cx, |t, cx| {
+            assert!(t.ingest(vec![Stream::Data(b"\x1b]2;\xe2\xa0\x8b working\x07".to_vec())], cx));
+        });
+        assert_eq!(focused_notifies.get(), 1);
+
+        focused.update(cx, |t, cx| {
+            t.shown_in.set(super::FRAME.load(Ordering::Relaxed).wrapping_sub(1));
+            assert!(t.ingest(vec![Stream::Data(b"hidden\r\n".to_vec())], cx));
+        });
+        assert_eq!(focused_notifies.get(), 1);
+
+        cx.deactivate_window();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        focused.update(cx, |t, cx| {
+            assert!(!t.window_active);
+            t.mark_shown();
+            let _ = t.grid.borrow_mut().vt.frame();
+            assert!(t.ingest(vec![Stream::Data(b"inactive\r\n".to_vec())], cx));
+        });
+        assert_eq!(focused_notifies.get(), 1);
+        cx.executor().advance_clock(Duration::from_millis(33));
+        cx.run_until_parked();
+        assert_eq!(focused_notifies.get(), 2);
+    }
+
+    #[gpui::test]
+    fn wheel_scroll_sends_program_input_in_alt_screen_and_mouse_modes(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+
+        struct Root(Entity<super::TerminalView>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(400.)).h(px(100.)).child(self.0.clone())
+            }
+        }
+
+        cx.update(gpui_base::init);
+        let (root, cx) = cx.add_window_view(|_, cx| {
+            Root(cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx)))
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let terminal = root.read_with(cx, |root, _| root.0.clone());
+        let wheel = || ScrollWheelEvent {
+            position: point(px(50.), px(50.)),
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        };
+
+        cx.simulate_event(wheel());
+        assert!(terminal.read_with(cx, |t, _| t.typed_at.get().is_none()));
+
+        terminal.update(cx, |t, _| t.grid.borrow_mut().vt.write(b"\x1b[?1049h"));
+        cx.simulate_event(wheel());
+        assert!(terminal.read_with(cx, |t, _| t.typed_at.get().is_some()));
+
+        terminal.update(cx, |t, _| {
+            t.typed_at.set(None);
+            t.grid.borrow_mut().vt.write(b"\x1b[?1049l\x1b[?1000h\x1b[?1006h");
+        });
+        cx.simulate_event(wheel());
+        assert!(terminal.read_with(cx, |t, _| t.typed_at.get().is_some()));
     }
 }
